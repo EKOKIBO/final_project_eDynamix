@@ -17,7 +17,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from threading import Thread
 
 from shipments import (
     FINAL_STATUSES,
@@ -38,7 +37,7 @@ _log_lock = threading.Lock()
 
 
 def get_logger(name: str = "delivery_tracking", log_file: str = LOG_FILE):
-    """Един логер за целия проект (main.py и database.py също могат да го ползват)."""
+    """Един логер за целия проект (main.py и database.py също го ползват)."""
     logger = logging.getLogger(name)
     with _log_lock:
         if not logger.handlers:
@@ -111,7 +110,11 @@ def _field(obj, name):
 
 
 def pick_next_status(current_status) -> str:
-    """Случаен нов статус. Крайните статуси не се променят."""
+    """Случаен нов статус от списъка 'в движение'.
+
+    Крайните статуси НЕ се променят. Обратно - нишките никога не задават
+    краен статус: приключването на пратка е ръчно действие (меню 4).
+    """
     current = clean(current_status)
     if current in FINAL_STATUSES:
         return current
@@ -128,7 +131,10 @@ def process_shipment(shipment, delay_range=DELAY_RANGE, simulate: bool = True) -
             raise ValidationError("Липсва номер за проследяване.")
         if simulate:
             low, high = int(delay_range[0]), int(delay_range[1])
-            time.sleep(random.randint(min(low, high), max(low, high)))
+            delay = random.randint(min(low, high), max(low, high))
+            safe_print(f"   [{threading.current_thread().name}] {tracking_number}: старт ({delay} сек.)")
+            time.sleep(delay)
+            safe_print(f"   [{threading.current_thread().name}] {tracking_number}: готово")
         new_status = validate_status(pick_next_status(_field(shipment, "current_status")))
         elapsed = time.monotonic() - started
         log.info("Обработена %s -> %s за %.2f сек.", tracking_number, new_status, elapsed)
@@ -147,7 +153,7 @@ def process_batch(
     delay_range=DELAY_RANGE,
     simulate: bool = True,
 ) -> list[ProcessResult]:
-    """ ThreadPoolExecutor.
+    """ThreadPoolExecutor.
 
     Връща резултатите В СЪЩИЯ РЕД като входа (executor.map пази реда).
     """
@@ -156,7 +162,7 @@ def process_batch(
         return []
     workers = max(1, min(int(max_workers), len(items)))
     job = partial(process_shipment, delay_range=delay_range, simulate=simulate)
-    log.info("Старт на обработка: %d пратки, %d нишки", len(items), workers)
+    log.info("Старт на обработка (pool): %d пратки, %d нишки", len(items), workers)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(job, items))
     log.info("Край на обработката: %d резултата", len(results))
@@ -165,7 +171,7 @@ def process_batch(
 
 # ---------------------------------------------------------------- вариант 2
 
-class ShipmentWorker(Thread):
+class ShipmentWorker(threading.Thread):
     """Допустимият вариант: собствен клас, наследяващ Thread."""
 
     def __init__(self, shipment, delay_range=DELAY_RANGE, simulate: bool = True):
@@ -189,11 +195,13 @@ def process_batch_threads(
     items = list(shipments)
     if not items:
         return []
+    log.info("Старт на обработка (Thread): %d пратки", len(items))
     workers = [ShipmentWorker(s, delay_range, simulate) for s in items]
     for worker in workers:
         worker.start()
     for worker in workers:
         worker.join()
+    log.info("Край на обработката (Thread): %d резултата", len(workers))
     return [
         w.result
         if w.result is not None

@@ -1,8 +1,12 @@
 """Домейн слой: модел Shipment + валидации + формат.
 
-Тук НЯМА SQL и НЯМА нишки - само чиста логика, за да може
-database.py, workers.py и main.py да ползват едни и същи правила.
+Тук НЯМА изпълнение на SQL и НЯМА нишки. Има само чиста логика и
+няколко безопасни SQL *фрагмента* (ORDER BY / WHERE), които се строят
+единствено от бял списък - така database.py, workers.py и main.py
+ползват едни и същи правила.
 """
+
+from __future__ import annotations  # позволява 'str | None' и на Python 3.8/3.9
 
 import math
 import re
@@ -33,7 +37,7 @@ STATUSES = (
     STATUS_FAILED,
 )
 
-# крайни статуси - пратката не се обработва повече
+# крайни статуси - пратката не се обработва повече от нишките
 FINAL_STATUSES = (STATUS_DELIVERED, STATUS_FAILED)
 
 # статуси, които нишките могат да задават при симулация
@@ -59,6 +63,15 @@ COLUMNS = (
 )
 INSERT_COLUMNS = COLUMNS[1:]  # без id (AUTOINCREMENT)
 
+# колони, които потребителят има право да редактира (меню 10)
+EDITABLE_COLUMNS = (
+    "sender_name",
+    "recipient_name",
+    "origin_city",
+    "destination_city",
+    "weight",
+)
+
 # полета, по които е разрешено сортиране (ORDER BY не приема параметри,
 # затова се ползва whitelist - иначе има риск от SQL injection)
 SORT_FIELDS = {
@@ -72,9 +85,35 @@ SORT_FIELDS = {
     "статус": "current_status",
 }
 
+# подредено меню за сортиране (ключ, надпис) - ползва се от main.py
+SORT_MENU = (
+    ("тегло", "Тегло"),
+    ("дата", "Дата на създаване"),
+    ("град", "Краен град"),
+    ("номер", "Номер за проследяване"),
+    ("статус", "Текущ статус"),
+)
+
+# полета за текстово търсене (LIKE) - също whitelist
+SEARCH_FIELDS = {
+    "подател": "sender_name",
+    "получател": "recipient_name",
+    "начален град": "origin_city",
+    "краен град": "destination_city",
+    "град": "destination_city",
+}
+
+SEARCH_MENU = (
+    ("подател", "Подател"),
+    ("получател", "Получател"),
+    ("начален град", "Начален град"),
+    ("краен град", "Краен град"),
+)
+
 TRACKING_PREFIX = "ZIP"
 TRACKING_START = 1001
-# Валидиране на тракинг ид-та: 3-20 символи; главни букви, цифри, точки, underscore, и тирета
+# Валидиране на тракинг ид-та: 3-20 символа; главни латински букви,
+# цифри, underscore и тире. (Точка НЕ се допуска.)
 TRACKING_RE = re.compile(r"^[A-Z0-9_-]{3,20}$")
 _AUTO_RE = re.compile(r"^" + TRACKING_PREFIX + r"(\d+)$")
 
@@ -149,6 +188,24 @@ def parse_weight(value) -> float:
     return round(w, 3)
 
 
+def parse_min_weight(value) -> float:
+    """Като parse_weight, но за филтър 'поне X kg' - тук 0 е допустимо."""
+    raw = clean(value).replace(",", ".")
+    if not raw:
+        raise ValidationError("Минималното тегло не може да е празно.")
+    try:
+        w = float(raw)
+    except (TypeError, ValueError):
+        raise ValidationError("Минималното тегло трябва да е число.") from None
+    if math.isnan(w) or math.isinf(w):
+        raise ValidationError("Минималното тегло трябва да е реално число.")
+    if w < 0:
+        raise ValidationError("Минималното тегло не може да е отрицателно.")
+    if w > MAX_WEIGHT:
+        raise ValidationError(f"Минималното тегло не може да е над {MAX_WEIGHT:g} kg.")
+    return round(w, 3)
+
+
 def validate_status(value) -> str:
     v = clean(value)
     if not v:
@@ -158,15 +215,42 @@ def validate_status(value) -> str:
     return v
 
 
-def status_by_index(choice) -> str:
-    """Меню избор 1..8 -> статус. Ползва се от main.py."""
+def choice_index(choice, count: int) -> int:
+    """'3' -> 3, с проверка за диапазон 1..count. Общо за всички менюта."""
     raw = clean(choice)
     if not raw.isdigit():
         raise ValidationError("Моля, въведете валидно число.")
     idx = int(raw)
-    if not 1 <= idx <= len(STATUSES):
-        raise ValidationError(f"Изберете число от 1 до {len(STATUSES)}.")
-    return STATUSES[idx - 1]
+    if not 1 <= idx <= count:
+        raise ValidationError(f"Изберете число от 1 до {count}.")
+    return idx
+
+
+def status_by_index(choice) -> str:
+    """Меню избор 1..len(STATUSES) -> статус."""
+    return STATUSES[choice_index(choice, len(STATUSES)) - 1]
+
+
+def sort_key_by_index(choice) -> str:
+    """Меню избор 1..len(SORT_MENU) -> ключ за build_order_by()."""
+    return SORT_MENU[choice_index(choice, len(SORT_MENU)) - 1][0]
+
+
+def search_field_by_index(choice) -> str:
+    """Меню избор 1..len(SEARCH_MENU) -> ключ за resolve_search_field()."""
+    return SEARCH_MENU[choice_index(choice, len(SEARCH_MENU)) - 1][0]
+
+
+def resolve_search_field(field) -> str:
+    """Ключ на български -> име на колона. Непознато поле = грешка, НЕ тихо
+    връщане към 'краен град' (иначе потребителят вижда грешни резултати)."""
+    key = clean(field).lower()
+    column = SEARCH_FIELDS.get(key)
+    if column is None:
+        raise ValidationError(
+            "Търсене е възможно по: " + ", ".join(sorted(SEARCH_FIELDS))
+        )
+    return column
 
 
 # -------------------------------- история -----------------------
@@ -237,6 +321,39 @@ def build_order_by(field, descending: bool = False) -> str:
     return f"ORDER BY {column} {'DESC' if descending else 'ASC'}"
 
 
+def build_filter(status=None, city=None, min_weight=None) -> tuple[str, tuple]:
+    """Безопасен WHERE фрагмент + параметри за филтриране.
+
+    Върнатият SQL съдържа САМО '?' плейсхолдъри - никакви потребителски
+    стойности не се лепят в текста на заявката.
+    Градът се търси и в началния, и в крайния град.
+    """
+    clauses = []
+    params: list = []
+
+    if clean(status):
+        clauses.append("current_status = ?")
+        params.append(validate_status(status))
+
+    if clean(city):
+        pattern = like_pattern(city)
+        clauses.append(
+            "(PYLOWER(origin_city) LIKE PYLOWER(?) ESCAPE '\\' "
+            "OR PYLOWER(destination_city) LIKE PYLOWER(?) ESCAPE '\\')"
+        )
+        params.append(pattern)
+        params.append(pattern)
+
+    if clean(min_weight):
+        clauses.append("weight >= ?")
+        params.append(parse_min_weight(min_weight))
+
+    if not clauses:
+        raise ValidationError("Не е зададен нито един филтър.")
+
+    return "WHERE " + " AND ".join(clauses), tuple(params)
+
+
 # ---------------------------------------------------------------- модел
 
 class Shipment:
@@ -253,7 +370,7 @@ class Shipment:
         current_status=STATUS_REGISTERED,
         status_history="",
         created_at=None,
-        id=None,
+        shipment_id=None,
         strict=True,
     ):
         if strict:
@@ -278,7 +395,7 @@ class Shipment:
             self.current_status = clean(current_status) or STATUS_REGISTERED
         self.status_history = status_history or ""
         self.created_at = clean(created_at) or now_ts()
-        self.id = id
+        self.id = shipment_id
 
     # --- фабрики ---
 
@@ -331,7 +448,7 @@ class Shipment:
             current_status=data["current_status"],
             status_history=data["status_history"],
             created_at=data["created_at"],
-            id=data["id"],
+            shipment_id=data["id"],
             strict=False,
         )
 
@@ -354,7 +471,7 @@ class Shipment:
         weight=None,
     ) -> dict:
         """Редакция. Празна стойност = без промяна. Връща {колона: нова ст-ст}."""
-        changes: dict[str, object] = {}
+        changes: dict = {}
         if clean(sender_name):
             changes["sender_name"] = validate_text(sender_name, "Име на подател")
         if clean(recipient_name):
@@ -437,11 +554,11 @@ class Shipment:
 
 # ---------------------------------------------------------------- статистика
 
-def summarize_shipments(shipments) -> dict:
-    """Резервна статистика в Python (SQL вариантът е в database.py)."""
-    items = list(shipments)
+def summarize_shipments(items) -> dict:
+    """Резервна статистика в Python (основният SQL вариант е в database.py)."""
+    items = list(items)
     weights = [s.weight for s in items]
-    by_status: dict[str, int] = {}
+    by_status: dict = {}
     for s in items:
         by_status[s.current_status] = by_status.get(s.current_status, 0) + 1
     return {
